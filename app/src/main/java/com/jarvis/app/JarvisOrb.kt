@@ -1,89 +1,308 @@
 package com.jarvis.app
 
-import android.content.Context
-import android.graphics.Canvas
+import android.Manifest
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.pm.PackageManager
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.RadialGradient
-import android.graphics.RectF
-import android.graphics.Shader
-import android.view.View
-import kotlin.math.min
-import kotlin.math.sin
+import android.graphics.Typeface
+import android.media.MediaRecorder
+import android.os.Bundle
+import android.text.InputType
+import android.view.Gravity
+import android.view.ViewGroup
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.DataOutputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
-class JarvisOrb(context: Context) : View(context) {
+class KeyException(msg: String) : Exception(msg)
 
-    // 0 = idle, 1 = listening, 2 = thinking
-    var state = 0
+class MainActivity : Activity() {
 
-    private var angle = 0f
-    private var pulse = 0f
-    private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-    private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val rect = RectF()
+    private lateinit var orb: JarvisOrb
+    private lateinit var status: TextView
+    private lateinit var result: TextView
+    private var recorder: MediaRecorder? = null
+    private var recording = false
+    private var busy = false
+    private val audioFile by lazy { File(cacheDir, "rec.m4a") }
+    private val cyan = Color.parseColor("#00E5FF")
 
-    override fun onDraw(c: Canvas) {
-        super.onDraw(c)
-        val cx = width / 2f
-        val cy = height / 2f
-        val r = min(width, height) / 2f * 0.92f
-        val color = if (state == 1) Color.parseColor("#FF5252") else Color.parseColor("#00E5FF")
-        val speed = when (state) { 0 -> 0.6f; 1 -> 1.6f; else -> 5f }
-        angle += speed
-        pulse += if (state == 1) 0.15f else 0.06f
-        val beat = (sin(pulse.toDouble()).toFloat() + 1f) / 2f
+    private val chatModel = "llama-3.3-70b-versatile"
+    private val history = ArrayList<Pair<String, String>>() // role to text
 
-        // glowing core
-        val coreR = r * (0.30f + 0.05f * beat)
-        fill.shader = RadialGradient(
-            cx, cy, coreR * 1.8f,
-            intArrayOf(Color.argb(255, Color.red(color), Color.green(color), Color.blue(color)),
-                Color.argb(90, Color.red(color), Color.green(color), Color.blue(color)),
-                Color.TRANSPARENT),
-            floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP
-        )
-        c.drawCircle(cx, cy, coreR * 1.8f, fill)
-        fill.shader = null
-        fill.color = Color.WHITE
-        fill.alpha = 200
-        c.drawCircle(cx, cy, coreR * 0.25f, fill)
+    private val systemPrompt =
+        "You are Jarvis, a smart, polite and witty voice assistant like the one in Iron Man. " +
+        "The user speaks to you, so keep answers short and clear: 1 to 3 sentences unless asked for more. " +
+        "Do not use markdown, bullet points or emojis. Reply in the same language the user speaks."
 
-        ring.color = color
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun prefs() = getSharedPreferences("jarvis", MODE_PRIVATE)
 
-        // outer thin ring
-        ring.strokeWidth = 3f
-        ring.alpha = 200
-        c.drawCircle(cx, cy, r, ring)
+    private fun getKeys(): List<String> {
+        val saved = prefs().getString("keys", null) ?: prefs().getString("key", "") ?: ""
+        return saved.split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+    }
 
-        // tick marks
-        ring.strokeWidth = 3f
-        ring.alpha = 130
-        c.save()
-        c.rotate(-angle * 0.3f, cx, cy)
-        for (i in 0 until 60) {
-            val len = if (i % 5 == 0) r * 0.07f else r * 0.035f
-            c.drawLine(cx, cy - r * 0.92f, cx, cy - r * 0.92f + len, ring)
-            c.rotate(6f, cx, cy)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.statusBarColor = Color.parseColor("#020B14")
+        window.navigationBarColor = Color.parseColor("#020B14")
+
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(Color.parseColor("#020B14"))
+        root.gravity = Gravity.CENTER_HORIZONTAL
+        root.setPadding(dp(20), dp(40), dp(20), dp(20))
+
+        val title = TextView(this)
+        title.text = "J.A.R.V.I.S"
+        title.setTextColor(cyan)
+        title.textSize = 26f
+        title.typeface = Typeface.MONOSPACE
+        title.letterSpacing = 0.3f
+        title.gravity = Gravity.CENTER
+        root.addView(title)
+
+        status = TextView(this)
+        status.text = "TAP THE CORE TO SPEAK"
+        status.setTextColor(Color.parseColor("#4DB6C4"))
+        status.textSize = 12f
+        status.typeface = Typeface.MONOSPACE
+        status.letterSpacing = 0.15f
+        status.gravity = Gravity.CENTER
+        status.setPadding(0, dp(8), 0, 0)
+        root.addView(status)
+
+        orb = JarvisOrb(this)
+        root.addView(orb, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val scroll = ScrollView(this)
+        result = TextView(this)
+        result.setTextColor(Color.WHITE)
+        result.textSize = 16f
+        result.typeface = Typeface.MONOSPACE
+        result.gravity = Gravity.CENTER
+        scroll.addView(result)
+        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(170)))
+
+        val keyBtn = TextView(this)
+        keyBtn.text = "[ SET API KEYS ]"
+        keyBtn.setTextColor(cyan)
+        keyBtn.textSize = 12f
+        keyBtn.typeface = Typeface.MONOSPACE
+        keyBtn.gravity = Gravity.CENTER
+        keyBtn.setPadding(dp(10), dp(14), dp(10), dp(14))
+        keyBtn.setOnClickListener { askKey() }
+        root.addView(keyBtn)
+
+        orb.setOnClickListener { toggle() }
+        setContentView(root)
+    }
+
+    private fun askKey() {
+        val input = EditText(this)
+        input.hint = "gsk_...\ngsk_..."
+        input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        input.setMinLines(4)
+        input.gravity = Gravity.TOP
+        input.setText(getKeys().joinToString("\n"))
+        AlertDialog.Builder(this)
+            .setTitle("Groq API keys")
+            .setMessage("One key per line. Use keys from different Groq accounts. Get them at console.groq.com")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                prefs().edit()
+                    .putString("keys", input.text.toString())
+                    .putInt("idx", 0)
+                    .apply()
+                Toast.makeText(this, "${getKeys().size} key(s) saved", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun toggle() {
+        if (busy) return
+        if (getKeys().isEmpty()) {
+            askKey(); return
         }
-        c.restore()
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+            return
+        }
+        if (!recording) startRecording() else stopRecording()
+    }
 
-        // thick rotating arcs
-        ring.strokeWidth = 10f
-        ring.alpha = 230
-        rect.set(cx - r * 0.78f, cy - r * 0.78f, cx + r * 0.78f, cy + r * 0.78f)
-        for (i in 0 until 3) c.drawArc(rect, angle + i * 120f, 70f, false, ring)
+    override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
+        super.onRequestPermissionsResult(code, perms, results)
+        if (results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED) {
+            status.text = "MIC READY. TAP THE CORE"
+        } else {
+            status.text = "MIC PERMISSION DENIED"
+        }
+    }
 
-        // counter-rotating arcs
-        ring.strokeWidth = 5f
-        ring.alpha = 180
-        rect.set(cx - r * 0.62f, cy - r * 0.62f, cx + r * 0.62f, cy + r * 0.62f)
-        for (i in 0 until 4) c.drawArc(rect, -angle * 1.5f + i * 90f, 45f, false, ring)
+    @Suppress("DEPRECATION")
+    private fun startRecording() {
+        try {
+            val r = MediaRecorder()
+            r.setAudioSource(MediaRecorder.AudioSource.MIC)
+            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            r.setAudioSamplingRate(16000)
+            r.setAudioEncodingBitRate(64000)
+            r.setOutputFile(audioFile.absolutePath)
+            r.prepare()
+            r.start()
+            recorder = r
+            recording = true
+            orb.state = 1
+            status.text = "LISTENING... TAP AGAIN TO SEND"
+            result.text = ""
+        } catch (e: Exception) {
+            status.text = "MIC ERROR"
+            result.text = e.message ?: "unknown error"
+        }
+    }
 
-        // inner ring
-        ring.strokeWidth = 2f
-        ring.alpha = 160
-        c.drawCircle(cx, cy, r * 0.5f, ring)
+    private fun stopRecording() {
+        try { recorder?.stop() } catch (e: Exception) { }
+        recorder?.release()
+        recorder = null
+        recording = false
+        busy = true
+        orb.state = 2
+        status.text = "PROCESSING..."
+        val keys = getKeys()
+        Thread {
+            try {
+                val heard = withFailover(keys) { transcribe(it) }
+                if (heard.isEmpty()) {
+                    runOnUiThread {
+                        orb.state = 0
+                        busy = false
+                        status.text = "TAP THE CORE TO SPEAK"
+                        result.text = "(nothing heard)"
+                    }
+                    return@Thread
+                }
+                runOnUiThread {
+                    status.text = "THINKING..."
+                    result.text = "YOU: $heard"
+                }
+                val answer = withFailover(keys) { askGroq(it, heard) }
+                history.add("user" to heard)
+                history.add("assistant" to answer)
+                while (history.size > 8) history.removeAt(0)
+                val used = prefs().getInt("idx", 0) + 1
+                runOnUiThread {
+                    orb.state = 0
+                    busy = false
+                    status.text = "JARVIS  (KEY $used OF ${keys.size})"
+                    result.text = "YOU: $heard\n\nJARVIS: $answer"
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    orb.state = 0
+                    busy = false
+                    status.text = "ERROR"
+                    result.text = e.message ?: "unknown error"
+                }
+            }
+        }.start()
+    }
 
-        postInvalidateOnAnimation()
+    // Runs "block" with each key in turn, starting from the last one that worked.
+    private fun <T> withFailover(keys: List<String>, block: (String) -> T): T {
+        val start = prefs().getInt("idx", 0) % keys.size
+        var lastError = ""
+        for (i in keys.indices) {
+            val idx = (start + i) % keys.size
+            try {
+                val value = block(keys[idx])
+                prefs().edit().putInt("idx", idx).apply()
+                return value
+            } catch (e: KeyException) {
+                lastError = "Key ${idx + 1}: ${e.message}"
+            }
+        }
+        throw Exception("All keys failed.\n$lastError")
+    }
+
+    private fun askGroq(key: String, question: String): String {
+        val messages = JSONArray()
+        messages.put(JSONObject().put("role", "system").put("content", systemPrompt))
+        for ((role, text) in history) {
+            messages.put(JSONObject().put("role", role).put("content", text))
+        }
+        messages.put(JSONObject().put("role", "user").put("content", question))
+
+        val payload = JSONObject()
+            .put("model", chatModel)
+            .put("messages", messages)
+            .put("temperature", 0.6)
+            .put("max_tokens", 400)
+
+        val conn = URL("https://api.groq.com/openai/v1/chat/completions")
+            .openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 15000
+        conn.readTimeout = 60000
+        conn.setRequestProperty("Authorization", "Bearer $key")
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.outputStream.use { it.write(payload.toString().toByteArray()) }
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val body = stream.bufferedReader().readText()
+        if (code == 429 || code == 401 || code == 403) throw KeyException("Error $code")
+        if (code !in 200..299) throw Exception("Error $code: $body")
+        return JSONObject(body)
+            .getJSONArray("choices")
+            .getJSONObject(0)
+            .getJSONObject("message")
+            .getString("content")
+            .trim()
+    }
+
+    private fun transcribe(key: String): String {
+        val boundary = "----jarvis" + System.currentTimeMillis()
+        val conn = URL("https://api.groq.com/openai/v1/audio/transcriptions")
+            .openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 15000
+        conn.readTimeout = 60000
+        conn.setRequestProperty("Authorization", "Bearer $key")
+        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+
+        val out = DataOutputStream(conn.outputStream)
+        fun field(name: String, value: String) {
+            out.writeBytes("--$boundary\r\nContent-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n")
+        }
+        field("model", "whisper-large-v3-turbo")
+        field("response_format", "json")
+        out.writeBytes("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"rec.m4a\"\r\nContent-Type: audio/m4a\r\n\r\n")
+        out.write(audioFile.readBytes())
+        out.writeBytes("\r\n--$boundary--\r\n")
+        out.flush()
+        out.close()
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val body = stream.bufferedReader().readText()
+        if (code == 429 || code == 401 || code == 403) throw KeyException("Error $code")
+        if (code !in 200..299) throw Exception("Error $code: $body")
+        return JSONObject(body).getString("text").trim()
     }
 }
