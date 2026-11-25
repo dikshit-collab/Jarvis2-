@@ -16,6 +16,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.DataOutputStream
 import java.io.File
@@ -31,8 +32,17 @@ class MainActivity : Activity() {
     private lateinit var result: TextView
     private var recorder: MediaRecorder? = null
     private var recording = false
+    private var busy = false
     private val audioFile by lazy { File(cacheDir, "rec.m4a") }
     private val cyan = Color.parseColor("#00E5FF")
+
+    private val chatModel = "llama-3.3-70b-versatile"
+    private val history = ArrayList<Pair<String, String>>()
+
+    private val systemPrompt =
+        "You are Jarvis, a smart, polite and witty voice assistant like the one in Iron Man. " +
+        "The user speaks to you, so keep answers short and clear: 1 to 3 sentences unless asked for more. " +
+        "Do not use markdown, bullet points or emojis. Reply in the same language the user speaks."
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun prefs() = getSharedPreferences("jarvis", MODE_PRIVATE)
@@ -78,11 +88,11 @@ class MainActivity : Activity() {
         val scroll = ScrollView(this)
         result = TextView(this)
         result.setTextColor(Color.WHITE)
-        result.textSize = 18f
+        result.textSize = 16f
         result.typeface = Typeface.MONOSPACE
         result.gravity = Gravity.CENTER
         scroll.addView(result)
-        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(130)))
+        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(170)))
 
         val keyBtn = TextView(this)
         keyBtn.text = "[ SET API KEYS ]"
@@ -121,8 +131,10 @@ class MainActivity : Activity() {
     }
 
     private fun toggle() {
+        if (busy) return
         if (getKeys().isEmpty()) {
-            askKey(); return
+            askKey()
+            return
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
@@ -137,6 +149,20 @@ class MainActivity : Activity() {
             status.text = "MIC READY. TAP THE CORE"
         } else {
             status.text = "MIC PERMISSION DENIED"
+        }
+    }
+
+    // Updates the screen from any thread.
+    private fun setUi(orbState: Int, statusText: String, resultText: String?, free: Boolean) {
+        runOnUiThread {
+            if (free) {
+                busy = false
+            }
+            orb.state = orbState
+            status.text = statusText
+            if (resultText != null) {
+                result.text = resultText
+            }
         }
     }
 
@@ -164,47 +190,89 @@ class MainActivity : Activity() {
     }
 
     private fun stopRecording() {
-        try { recorder?.stop() } catch (e: Exception) { }
+        try {
+            recorder?.stop()
+        } catch (e: Exception) {
+        }
         recorder?.release()
         recorder = null
         recording = false
+        busy = true
         orb.state = 2
         status.text = "PROCESSING..."
         val keys = getKeys()
         Thread {
             try {
-                val text = transcribeWithFailover(keys)
-                val used = prefs().getInt("idx", 0) + 1
-                runOnUiThread {
-                    orb.state = 0
-                    status.text = "YOU SAID  (KEY $used OF ${keys.size})"
-                    result.text = if (text.isEmpty()) "(nothing heard)" else text
+                val heard = withFailover(keys) { transcribe(it) }
+                if (heard.isEmpty()) {
+                    setUi(0, "TAP THE CORE TO SPEAK", "(nothing heard)", true)
+                } else {
+                    setUi(2, "THINKING...", "YOU: $heard", false)
+                    val answer = withFailover(keys) { askGroq(it, heard) }
+                    history.add(Pair("user", heard))
+                    history.add(Pair("assistant", answer))
+                    while (history.size > 8) {
+                        history.removeAt(0)
+                    }
+                    val used = prefs().getInt("idx", 0) + 1
+                    setUi(0, "JARVIS  (KEY $used OF ${keys.size})", "YOU: $heard\n\nJARVIS: $answer", true)
                 }
             } catch (e: Exception) {
-                runOnUiThread {
-                    orb.state = 0
-                    status.text = "ERROR"
-                    result.text = e.message ?: "unknown error"
-                }
+                setUi(0, "ERROR", e.message ?: "unknown error", true)
             }
         }.start()
     }
 
-    // Tries keys one by one, starting from the last one that worked.
-    private fun transcribeWithFailover(keys: List<String>): String {
+    // Runs "block" with each key in turn, starting from the last one that worked.
+    private fun <T> withFailover(keys: List<String>, block: (String) -> T): T {
         val start = prefs().getInt("idx", 0) % keys.size
         var lastError = ""
         for (i in keys.indices) {
             val idx = (start + i) % keys.size
             try {
-                val text = transcribe(keys[idx])
+                val value = block(keys[idx])
                 prefs().edit().putInt("idx", idx).apply()
-                return text
+                return value
             } catch (e: KeyException) {
                 lastError = "Key ${idx + 1}: ${e.message}"
             }
         }
         throw Exception("All keys failed.\n$lastError")
+    }
+
+    private fun askGroq(key: String, question: String): String {
+        val messages = JSONArray()
+        messages.put(JSONObject().put("role", "system").put("content", systemPrompt))
+        for (item in history) {
+            messages.put(JSONObject().put("role", item.first).put("content", item.second))
+        }
+        messages.put(JSONObject().put("role", "user").put("content", question))
+
+        val payload = JSONObject()
+        payload.put("model", chatModel)
+        payload.put("messages", messages)
+        payload.put("temperature", 0.6)
+        payload.put("max_tokens", 400)
+
+        val conn = URL("https://api.groq.com/openai/v1/chat/completions")
+            .openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 15000
+        conn.readTimeout = 60000
+        conn.setRequestProperty("Authorization", "Bearer $key")
+        conn.setRequestProperty("Content-Type", "application/json")
+        val os = conn.outputStream
+        os.write(payload.toString().toByteArray())
+        os.close()
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val body = stream.bufferedReader().readText()
+        if (code == 429 || code == 401 || code == 403) throw KeyException("Error $code")
+        if (code !in 200..299) throw Exception("Error $code: $body")
+        val choice = JSONObject(body).getJSONArray("choices").getJSONObject(0)
+        return choice.getJSONObject("message").getString("content").trim()
     }
 
     private fun transcribe(key: String): String {
