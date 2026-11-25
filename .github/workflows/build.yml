@@ -20,7 +20,7 @@ jobs:
           gradle assembleDebug --console=plain > build.log 2>&1
           code=$?
           echo "=========== ERRORS ==========="
-          grep -E "^e: " build.log | head -20
+          grep -E "\.kt:[0-9]+|^e: |error:" build.log | head -30
           echo "=========== END ==========="
           exit $code
       - uses: actions/upload-artifact@v4
