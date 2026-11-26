@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Bundle
 import android.text.InputType
@@ -22,6 +23,9 @@ import java.io.DataOutputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 class KeyException(msg: String) : Exception(msg)
 
@@ -30,26 +34,48 @@ class MainActivity : Activity() {
     private lateinit var orb: JarvisOrb
     private lateinit var status: TextView
     private lateinit var result: TextView
+    private lateinit var voiceBtn: TextView
     private var recorder: MediaRecorder? = null
     private var recording = false
     private var busy = false
+
+    @Volatile private var speaking = false
+    @Volatile private var stopFlag = false
+    @Volatile private var currentLatch: CountDownLatch? = null
+    @Volatile private var ttsError: String? = null
+    private val END = File("END")
+
     private val audioFile by lazy { File(cacheDir, "rec.m4a") }
     private val cyan = Color.parseColor("#00E5FF")
 
     private val chatModel = "openai/gpt-oss-120b"
+    private val ttsModel = "canopylabs/orpheus-v1-english"
+    private val ttsVoice = "autumn"
     private val history = ArrayList<Pair<String, String>>()
 
     private val systemPrompt =
         "You are Jarvis, a smart, polite and witty voice assistant like the one in Iron Man. " +
         "The user speaks to you, so keep answers short and clear: 1 to 3 sentences unless asked for more. " +
-        "Do not use markdown, bullet points or emojis. Reply in the same language the user speaks."
+        "Do not use markdown, bullet points, brackets or emojis. Reply in the same language the user speaks."
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun prefs() = getSharedPreferences("jarvis", MODE_PRIVATE)
+    private fun voiceOn() = prefs().getBoolean("voice", true)
 
     private fun getKeys(): List<String> {
         val saved = prefs().getString("keys", null) ?: prefs().getString("key", "") ?: ""
         return saved.split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+    }
+
+    private fun makeButton(label: String): TextView {
+        val b = TextView(this)
+        b.text = label
+        b.setTextColor(cyan)
+        b.textSize = 12f
+        b.typeface = Typeface.MONOSPACE
+        b.gravity = Gravity.CENTER
+        b.setPadding(dp(10), dp(14), dp(10), dp(14))
+        return b
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -94,18 +120,34 @@ class MainActivity : Activity() {
         scroll.addView(result)
         root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(170)))
 
-        val keyBtn = TextView(this)
-        keyBtn.text = "[ SET API KEYS ]"
-        keyBtn.setTextColor(cyan)
-        keyBtn.textSize = 12f
-        keyBtn.typeface = Typeface.MONOSPACE
-        keyBtn.gravity = Gravity.CENTER
-        keyBtn.setPadding(dp(10), dp(14), dp(10), dp(14))
+        val bottom = LinearLayout(this)
+        bottom.orientation = LinearLayout.HORIZONTAL
+        bottom.gravity = Gravity.CENTER
+
+        voiceBtn = makeButton(if (voiceOn()) "[ VOICE: ON ]" else "[ VOICE: OFF ]")
+        voiceBtn.setOnClickListener {
+            val now = !voiceOn()
+            prefs().edit().putBoolean("voice", now).apply()
+            voiceBtn.text = if (now) "[ VOICE: ON ]" else "[ VOICE: OFF ]"
+            if (!now) {
+                stopSpeaking()
+            }
+        }
+        bottom.addView(voiceBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val keyBtn = makeButton("[ SET API KEYS ]")
         keyBtn.setOnClickListener { askKey() }
-        root.addView(keyBtn)
+        bottom.addView(keyBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        root.addView(bottom, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         orb.setOnClickListener { toggle() }
         setContentView(root)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        stopSpeaking()
     }
 
     private fun askKey() {
@@ -131,6 +173,10 @@ class MainActivity : Activity() {
     }
 
     private fun toggle() {
+        if (speaking) {
+            stopSpeaking()
+            return
+        }
         if (busy) return
         if (getKeys().isEmpty()) {
             askKey()
@@ -215,13 +261,165 @@ class MainActivity : Activity() {
                         history.removeAt(0)
                     }
                     val used = prefs().getInt("idx", 0) + 1
-                    setUi(0, "JARVIS  (KEY $used OF ${keys.size})", "YOU: $heard\n\nJARVIS: $answer", true)
+                    val label = "JARVIS  (KEY $used OF ${keys.size})"
+                    val shown = "YOU: $heard\n\nJARVIS: $answer"
+                    if (voiceOn()) {
+                        speaking = true
+                        stopFlag = false
+                        ttsError = null
+                        setUi(0, "SPEAKING... TAP CORE TO STOP", shown, true)
+                        speak(answer, keys)
+                        val err = ttsError
+                        runOnUiThread {
+                            status.text = label
+                            if (err != null) {
+                                result.text = shown + "\n\n(voice error: " + err + ")"
+                            }
+                        }
+                    } else {
+                        setUi(0, label, shown, true)
+                    }
                 }
             } catch (e: Exception) {
+                speaking = false
                 setUi(0, "ERROR", e.message ?: "unknown error", true)
             }
         }.start()
     }
+
+    // ---------- Voice ----------
+
+    private fun stopSpeaking() {
+        stopFlag = true
+        currentLatch?.countDown()
+    }
+
+    // Downloads the voice in pieces and plays them one after another.
+    private fun speak(text: String, keys: List<String>) {
+        try {
+            val chunks = splitForTts(text)
+            if (chunks.isEmpty()) return
+            val queue = LinkedBlockingQueue<File>()
+            val stamp = System.currentTimeMillis()
+
+            Thread {
+                try {
+                    for ((i, chunk) in chunks.withIndex()) {
+                        if (stopFlag) break
+                        val bytes = withFailover(keys) { tts(it, chunk) }
+                        if (stopFlag) break
+                        val f = File(cacheDir, "tts_${stamp}_$i.wav")
+                        f.writeBytes(bytes)
+                        queue.put(f)
+                    }
+                } catch (e: Exception) {
+                    ttsError = e.message ?: "voice error"
+                } finally {
+                    queue.put(END)
+                }
+            }.start()
+
+            while (!stopFlag) {
+                val f = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                if (f === END) break
+                play(f)
+                f.delete()
+            }
+        } catch (e: Exception) {
+            ttsError = e.message ?: "voice error"
+        } finally {
+            speaking = false
+        }
+    }
+
+    private fun play(file: File) {
+        val latch = CountDownLatch(1)
+        currentLatch = latch
+        val mp = MediaPlayer()
+        try {
+            mp.setDataSource(file.absolutePath)
+            mp.setOnCompletionListener { latch.countDown() }
+            mp.setOnErrorListener { _, _, _ ->
+                latch.countDown()
+                true
+            }
+            mp.prepare()
+            mp.start()
+            latch.await()
+        } catch (e: Exception) {
+        } finally {
+            try {
+                mp.release()
+            } catch (e: Exception) {
+            }
+            currentLatch = null
+        }
+    }
+
+    // The voice model accepts about 200 characters per request, so cut the text into pieces.
+    private fun splitForTts(raw: String): List<String> {
+        val clean = raw.replace(Regex("[\\[\\]*#_`]"), "").replace(Regex("\\s+"), " ").trim()
+        if (clean.isEmpty()) return emptyList()
+        val sentences = clean.split(Regex("(?<=[.!?])\\s+"))
+        val chunks = ArrayList<String>()
+        var cur = ""
+        for (s0 in sentences) {
+            var s = s0
+            while (s.length > 190) {
+                var cut = s.lastIndexOf(' ', 190)
+                if (cut <= 0) cut = 190
+                if (cur.isNotEmpty()) {
+                    chunks.add(cur)
+                    cur = ""
+                }
+                chunks.add(s.substring(0, cut).trim())
+                s = s.substring(cut).trim()
+            }
+            if (cur.isEmpty()) {
+                cur = s
+            } else if (cur.length + 1 + s.length <= 190) {
+                cur = cur + " " + s
+            } else {
+                chunks.add(cur)
+                cur = s
+            }
+        }
+        if (cur.isNotEmpty()) chunks.add(cur)
+        return chunks.take(5)
+    }
+
+    private fun tts(key: String, text: String): ByteArray {
+        val payload = JSONObject()
+        payload.put("model", ttsModel)
+        payload.put("input", text)
+        payload.put("voice", ttsVoice)
+        payload.put("response_format", "wav")
+
+        val conn = URL("https://api.groq.com/openai/v1/audio/speech")
+            .openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 15000
+        conn.readTimeout = 60000
+        conn.setRequestProperty("Authorization", "Bearer $key")
+        conn.setRequestProperty("Content-Type", "application/json")
+        val os = conn.outputStream
+        os.write(payload.toString().toByteArray())
+        os.close()
+
+        val code = conn.responseCode
+        if (code in 200..299) {
+            return conn.inputStream.readBytes()
+        }
+        val body = conn.errorStream?.bufferedReader()?.readText() ?: ""
+        val short = body.take(200)
+        if (code == 429 || code == 401 || code == 403 || body.contains("terms", true)) {
+            throw KeyException("Error $code $short")
+        }
+        throw Exception("Error $code: $short")
+    }
+
+    // ---------- Groq: keys, chat, speech to text ----------
 
     // Runs "block" with each key in turn, starting from the last one that worked.
     private fun <T> withFailover(keys: List<String>, block: (String) -> T): T {
