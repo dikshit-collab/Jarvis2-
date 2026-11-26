@@ -36,7 +36,7 @@ class MainActivity : Activity() {
     private val audioFile by lazy { File(cacheDir, "rec.m4a") }
     private val cyan = Color.parseColor("#00E5FF")
 
-    private val chatModel = "llama-3.3-70b-versatile"
+    private val chatModel = "openai/gpt-oss-120b"
     private val history = ArrayList<Pair<String, String>>()
 
     private val systemPrompt =
@@ -252,7 +252,8 @@ class MainActivity : Activity() {
         payload.put("model", chatModel)
         payload.put("messages", messages)
         payload.put("temperature", 0.6)
-        payload.put("max_tokens", 400)
+        payload.put("max_tokens", 1500)
+        payload.put("reasoning_effort", "low")
 
         val conn = URL("https://api.groq.com/openai/v1/chat/completions")
             .openConnection() as HttpURLConnection
