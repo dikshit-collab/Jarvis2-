@@ -3,6 +3,7 @@ package com.jarvis.app
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -167,6 +168,39 @@ If the user asks for something you cannot do on the phone (like subscribing to a
 
         orb.setOnClickListener { toggle() }
         setContentView(root)
+
+        orb.post { handleLaunch() }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        JarvisState.resumedAt = System.currentTimeMillis()
+    }
+
+    override fun onNewIntent(newIntent: Intent?) {
+        super.onNewIntent(newIntent)
+        if (newIntent != null) {
+            setIntent(newIntent)
+        }
+        JarvisState.resumedAt = System.currentTimeMillis()
+        handleLaunch()
+    }
+
+    // When opened by the assistant gesture, start listening right away.
+    private fun handleLaunch() {
+        val i = intent ?: return
+        if (!i.getBooleanExtra("auto_listen", false)) return
+        i.removeExtra("auto_listen")
+        if (recording || busy || speaking) return
+        if (getKeys().isEmpty()) {
+            askKey()
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+            return
+        }
+        startRecording()
     }
 
     override fun onDestroy() {
