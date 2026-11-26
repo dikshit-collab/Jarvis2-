@@ -7,8 +7,9 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.MediaPlayer
+import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Bundle
 import android.text.InputType
@@ -25,7 +26,6 @@ import java.io.DataOutputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -43,9 +43,8 @@ class MainActivity : Activity() {
 
     @Volatile private var speaking = false
     @Volatile private var stopFlag = false
-    @Volatile private var currentLatch: CountDownLatch? = null
     @Volatile private var ttsError: String? = null
-    private val END = File("END")
+    private val END = ByteArray(0)
 
     private val audioFile by lazy { File(cacheDir, "rec.m4a") }
     private val cyan = Color.parseColor("#00E5FF")
@@ -294,7 +293,6 @@ class MainActivity : Activity() {
 
     private fun stopSpeaking() {
         stopFlag = true
-        currentLatch?.countDown()
     }
 
     // Downloads the voice in pieces and plays them one after another.
@@ -307,21 +305,18 @@ class MainActivity : Activity() {
 
             val chunks = splitForTts(text)
             if (chunks.isEmpty()) return
-            val queue = LinkedBlockingQueue<File>()
-            val stamp = System.currentTimeMillis()
+            val queue = LinkedBlockingQueue<ByteArray>()
 
             Thread {
                 try {
-                    for ((i, chunk) in chunks.withIndex()) {
+                    for (chunk in chunks) {
                         if (stopFlag) break
                         val bytes = withFailover(keys) { tts(it, chunk) }
                         if (stopFlag) break
                         if (bytes.size < 2000) {
                             throw Exception("voice audio too small (" + bytes.size + " bytes)")
                         }
-                        val f = File(cacheDir, "tts_${stamp}_$i.wav")
-                        f.writeBytes(bytes)
-                        queue.put(f)
+                        queue.put(bytes)
                     }
                 } catch (e: Exception) {
                     ttsError = e.message ?: "voice error"
@@ -331,11 +326,15 @@ class MainActivity : Activity() {
             }.start()
 
             while (!stopFlag) {
-                val f = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
-                if (f === END) break
+                val wav = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                if (wav === END) break
                 runOnUiThread { status.text = "SPEAKING... TAP CORE TO STOP" }
-                play(f)
-                f.delete()
+                try {
+                    playWav(wav)
+                } catch (e: Exception) {
+                    ttsError = "player: " + (e.message ?: e.toString())
+                    break
+                }
             }
         } catch (e: Exception) {
             ttsError = e.message ?: "voice error"
@@ -344,35 +343,92 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun play(file: File) {
-        val latch = CountDownLatch(1)
-        currentLatch = latch
-        val mp = MediaPlayer()
-        try {
-            mp.setAudioAttributes(
+    private fun le16(b: ByteArray, i: Int): Int {
+        return (b[i].toInt() and 0xFF) or ((b[i + 1].toInt() and 0xFF) shl 8)
+    }
+
+    private fun le32(b: ByteArray, i: Int): Int {
+        return (b[i].toInt() and 0xFF) or
+            ((b[i + 1].toInt() and 0xFF) shl 8) or
+            ((b[i + 2].toInt() and 0xFF) shl 16) or
+            ((b[i + 3].toInt() and 0xFF) shl 24)
+    }
+
+    // Reads the WAV header by hand and plays the raw sound data.
+    private fun playWav(wav: ByteArray) {
+        if (wav.size < 44) throw Exception("audio too short")
+        var channels = 1
+        var rate = 48000
+        var bits = 16
+        var dataStart = 44
+        var pos = 12
+        while (pos + 8 <= wav.size) {
+            val id = String(wav, pos, 4, Charsets.US_ASCII)
+            val size = le32(wav, pos + 4)
+            if (id == "fmt " && pos + 24 <= wav.size) {
+                channels = le16(wav, pos + 10)
+                rate = le32(wav, pos + 12)
+                bits = le16(wav, pos + 22)
+            }
+            if (id == "data") {
+                dataStart = pos + 8
+                break
+            }
+            if (size < 0) break
+            pos += 8 + size
+        }
+        if (bits != 16) throw Exception("unsupported audio ($bits-bit)")
+        if (channels < 1 || channels > 2) channels = 1
+        if (rate < 8000 || rate > 96000) rate = 48000
+
+        val frameSize = 2 * channels
+        val end = dataStart + ((wav.size - dataStart) / frameSize) * frameSize
+        val totalFrames = (end - dataStart) / frameSize
+        if (totalFrames <= 0) throw Exception("no audio data")
+
+        val mask = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
+        val minBuf = AudioTrack.getMinBufferSize(rate, mask, AudioFormat.ENCODING_PCM_16BIT)
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
-            mp.setDataSource(file.absolutePath)
-            mp.setOnCompletionListener { latch.countDown() }
-            mp.setOnErrorListener { _, what, extra ->
-                ttsError = "player error $what/$extra"
-                latch.countDown()
-                true
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(rate)
+                    .setChannelMask(mask)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(minBuf, 16384))
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+
+        try {
+            track.play()
+            var off = dataStart
+            while (off < end && !stopFlag) {
+                val n = minOf(8192, end - off)
+                val w = track.write(wav, off, n)
+                if (w <= 0) break
+                off += w
             }
-            mp.prepare()
-            mp.start()
-            latch.await()
-        } catch (e: Exception) {
-            ttsError = "player: " + (e.message ?: e.toString())
+            // wait until the sound has finished playing
+            val durationMs = totalFrames * 1000L / rate
+            val deadline = System.currentTimeMillis() + durationMs + 3000
+            while (!stopFlag && track.playbackHeadPosition < totalFrames &&
+                System.currentTimeMillis() < deadline
+            ) {
+                Thread.sleep(50)
+            }
         } finally {
             try {
-                mp.release()
+                track.stop()
             } catch (e: Exception) {
             }
-            currentLatch = null
+            track.release()
         }
     }
 
