@@ -6,6 +6,8 @@ import android.app.AlertDialog
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Bundle
@@ -80,6 +82,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        volumeControlStream = AudioManager.STREAM_MUSIC
         window.statusBarColor = Color.parseColor("#020B14")
         window.navigationBarColor = Color.parseColor("#020B14")
 
@@ -267,7 +270,7 @@ class MainActivity : Activity() {
                         speaking = true
                         stopFlag = false
                         ttsError = null
-                        setUi(0, "SPEAKING... TAP CORE TO STOP", shown, true)
+                        setUi(0, "LOADING VOICE...", shown, true)
                         speak(answer, keys)
                         val err = ttsError
                         runOnUiThread {
@@ -297,6 +300,11 @@ class MainActivity : Activity() {
     // Downloads the voice in pieces and plays them one after another.
     private fun speak(text: String, keys: List<String>) {
         try {
+            val am = getSystemService(AUDIO_SERVICE) as AudioManager
+            if (am.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
+                ttsError = "media volume is 0. Press the volume up button"
+            }
+
             val chunks = splitForTts(text)
             if (chunks.isEmpty()) return
             val queue = LinkedBlockingQueue<File>()
@@ -308,6 +316,9 @@ class MainActivity : Activity() {
                         if (stopFlag) break
                         val bytes = withFailover(keys) { tts(it, chunk) }
                         if (stopFlag) break
+                        if (bytes.size < 2000) {
+                            throw Exception("voice audio too small (" + bytes.size + " bytes)")
+                        }
                         val f = File(cacheDir, "tts_${stamp}_$i.wav")
                         f.writeBytes(bytes)
                         queue.put(f)
@@ -322,6 +333,7 @@ class MainActivity : Activity() {
             while (!stopFlag) {
                 val f = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
                 if (f === END) break
+                runOnUiThread { status.text = "SPEAKING... TAP CORE TO STOP" }
                 play(f)
                 f.delete()
             }
@@ -337,9 +349,16 @@ class MainActivity : Activity() {
         currentLatch = latch
         val mp = MediaPlayer()
         try {
+            mp.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
             mp.setDataSource(file.absolutePath)
             mp.setOnCompletionListener { latch.countDown() }
-            mp.setOnErrorListener { _, _, _ ->
+            mp.setOnErrorListener { _, what, extra ->
+                ttsError = "player error $what/$extra"
                 latch.countDown()
                 true
             }
@@ -347,6 +366,7 @@ class MainActivity : Activity() {
             mp.start()
             latch.await()
         } catch (e: Exception) {
+            ttsError = "player: " + (e.message ?: e.toString())
         } finally {
             try {
                 mp.release()
