@@ -3,19 +3,12 @@ package com.jarvis.app
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
-import android.media.AudioAttributes
-import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioTrack
 import android.media.MediaRecorder
-import android.net.Uri
 import android.os.Bundle
-import android.provider.AlarmClock
-import android.provider.ContactsContract
 import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
@@ -350,7 +343,7 @@ If the user asks for something you cannot do on the phone (like subscribing to a
         if (action == "answer") return
         runOnUiThread {
             val note = try {
-                doAction(action, o)
+                Commands.run(this, action, o)
             } catch (e: Exception) {
                 "Action failed: " + (e.message ?: e.toString())
             }
@@ -360,152 +353,174 @@ If the user asks for something you cannot do on the phone (like subscribing to a
         }
     }
 
-    private fun startSafe(i: Intent): Boolean {
-        return try {
-            startActivity(i)
-            true
-        } catch (e: Exception) {
-            false
-        }
+    // ---------- Voice ----------
+
+    private fun stopSpeaking() {
+        stopFlag = true
     }
 
-    private fun doAction(action: String, o: JSONObject): String? {
-        when (action) {
-            "open_app" -> {
-                val name = o.optString("app").trim()
-                val intent = findApp(name) ?: return "I could not find an app called $name"
-                startActivity(intent)
-            }
-            "youtube_search" -> {
-                val q = o.optString("query").trim()
-                if (q.isEmpty()) return "No search words heard"
-                val uri = Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(q))
-                val yt = Intent(Intent.ACTION_VIEW, uri)
-                yt.setPackage("com.google.android.youtube")
-                if (!startSafe(yt) && !startSafe(Intent(Intent.ACTION_VIEW, uri))) {
-                    return "Could not open YouTube"
-                }
-            }
-            "open_website" -> {
-                var u = o.optString("url").trim()
-                if (u.isEmpty()) return "No website given"
-                if (!u.startsWith("http")) {
-                    if (!u.contains(".")) u += ".com"
-                    u = "https://" + u
-                }
-                if (!startSafe(Intent(Intent.ACTION_VIEW, Uri.parse(u)))) {
-                    return "Could not open the website"
-                }
-            }
-            "call" -> return doCall(o.optString("contact"))
-            "set_alarm" -> {
-                val h = o.optInt("hour", -1)
-                val m = o.optInt("minute", 0)
-                if (h !in 0..23 || m !in 0..59) return "I did not understand the alarm time"
-                val i = Intent(AlarmClock.ACTION_SET_ALARM)
-                i.putExtra(AlarmClock.EXTRA_HOUR, h)
-                i.putExtra(AlarmClock.EXTRA_MINUTES, m)
-                i.putExtra(AlarmClock.EXTRA_MESSAGE, o.optString("label", "Jarvis"))
-                i.putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-                if (!startSafe(i)) return "Could not set the alarm"
-            }
-            "set_timer" -> {
-                val s = o.optInt("seconds", 0)
-                if (s !in 1..86400) return "I did not understand the timer length"
-                val i = Intent(AlarmClock.ACTION_SET_TIMER)
-                i.putExtra(AlarmClock.EXTRA_LENGTH, s)
-                i.putExtra(AlarmClock.EXTRA_MESSAGE, o.optString("label", "Jarvis"))
-                i.putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-                if (!startSafe(i)) return "Could not set the timer"
-            }
-            "maps_search" -> {
-                val q = o.optString("query").trim()
-                if (q.isEmpty()) return "No place heard"
-                val uri = Uri.parse("geo:0,0?q=" + Uri.encode(q))
-                val maps = Intent(Intent.ACTION_VIEW, uri)
-                maps.setPackage("com.google.android.apps.maps")
-                if (!startSafe(maps) && !startSafe(Intent(Intent.ACTION_VIEW, uri))) {
-                    return "Could not open Maps"
-                }
-            }
-            "directions" -> {
-                val d = o.optString("destination").trim()
-                if (d.isEmpty()) return "No destination heard"
-                val nav = Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=" + Uri.encode(d)))
-                nav.setPackage("com.google.android.apps.maps")
-                val web = Intent(
-                    Intent.ACTION_VIEW,
-                    Uri.parse("https://www.google.com/maps/dir/?api=1&destination=" + Uri.encode(d))
-                )
-                if (!startSafe(nav) && !startSafe(web)) return "Could not open Maps"
-            }
-            else -> {
-            }
-        }
-        return null
-    }
-
-    // Finds an installed app whose name matches what you said.
-    private fun findApp(name: String): Intent? {
-        val q = name.trim().lowercase()
-        if (q.isEmpty()) return null
-        val pm = packageManager
-        val main = Intent(Intent.ACTION_MAIN)
-        main.addCategory(Intent.CATEGORY_LAUNCHER)
-        val apps = pm.queryIntentActivities(main, 0)
-        var best: String? = null
-        var bestScore = 0
-        for (ri in apps) {
-            val label = ri.loadLabel(pm).toString().lowercase()
-            val score = when {
-                label == q -> 3
-                label.startsWith(q) -> 2
-                label.contains(q) || (label.length >= 3 && q.contains(label)) -> 1
-                else -> 0
-            }
-            if (score > bestScore) {
-                bestScore = score
-                best = ri.activityInfo.packageName
-            }
-        }
-        val pkg = best ?: return null
-        return pm.getLaunchIntentForPackage(pkg)
-    }
-
-    private fun doCall(target: String): String? {
-        val t = target.trim()
-        if (t.isEmpty()) return "Who should I call?"
-        val hasLetters = t.any { it.isLetter() }
-        val haveCall = checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
-        val haveContacts = checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
-        if (!haveCall || (hasLetters && !haveContacts)) {
-            requestPermissions(
-                arrayOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_CONTACTS),
-                2
-            )
-            return "Allow the permissions, then ask me again"
-        }
-        var number = t
-        if (hasLetters) {
-            number = findContactNumber(t) ?: return "No contact found for $t"
-        }
-        val clean = number.filter { it.isDigit() || it == '+' }
-        if (clean.isEmpty()) return "That number does not look right"
-        startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + clean)))
-        return null
-    }
-
-    private fun findContactNumber(name: String): String? {
-        val cursor = contentResolver.query(
-            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
-            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?",
-            arrayOf("%" + name + "%"),
-            null
-        )
-        if (cursor == null) return null
+    // Downloads the voice in pieces and plays them one after another.
+    private fun speak(text: String, keys: List<String>) {
         try {
-            if (cursor.moveToFirst()) return cursor.getString(0)
+            val am = getSystemService(AUDIO_SERVICE) as AudioManager
+            if (am.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
+                ttsError = "media volume is 0. Press the volume up button"
+            }
+
+            val chunks = AudioUtil.splitForTts(text)
+            if (chunks.isEmpty()) return
+            val queue = LinkedBlockingQueue<ByteArray>()
+
+            Thread {
+                try {
+                    for (chunk in chunks) {
+                        if (stopFlag) break
+                        val bytes = withFailover(keys) { tts(it, chunk) }
+                        if (stopFlag) break
+                        if (bytes.size < 2000) {
+                            throw Exception("voice audio too small (" + bytes.size + " bytes)")
+                        }
+                        queue.put(bytes)
+                    }
+                } catch (e: Exception) {
+                    ttsError = e.message ?: "voice error"
+                } finally {
+                    queue.put(END)
+                }
+            }.start()
+
+            while (!stopFlag) {
+                val wav = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                if (wav === END) break
+                runOnUiThread { status.text = "SPEAKING... TAP CORE TO STOP" }
+                try {
+                    AudioUtil.playWav(wav) { stopFlag }
+                } catch (e: Exception) {
+                    ttsError = "player: " + (e.message ?: e.toString())
+                    break
+                }
+            }
+        } catch (e: Exception) {
+            ttsError = e.message ?: "voice error"
         } finally {
-            cursor.close()
-     
+            speaking = false
+        }
+    }
+
+    private fun tts(key: String, text: String): ByteArray {
+        val payload = JSONObject()
+        payload.put("model", ttsModel)
+        payload.put("input", text)
+        payload.put("voice", ttsVoice)
+        payload.put("response_format", "wav")
+
+        val conn = URL("https://api.groq.com/openai/v1/audio/speech")
+            .openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 15000
+        conn.readTimeout = 60000
+        conn.setRequestProperty("Authorization", "Bearer $key")
+        conn.setRequestProperty("Content-Type", "application/json")
+        val os = conn.outputStream
+        os.write(payload.toString().toByteArray())
+        os.close()
+
+        val code = conn.responseCode
+        if (code in 200..299) {
+            return conn.inputStream.readBytes()
+        }
+        val body = conn.errorStream?.bufferedReader()?.readText() ?: ""
+        val short = body.take(200)
+        if (code == 429 || code == 401 || code == 403 || body.contains("terms", true)) {
+            throw KeyException("Error $code $short")
+        }
+        throw Exception("Error $code: $short")
+    }
+
+    // ---------- Groq: keys, chat, speech to text ----------
+
+    // Runs "block" with each key in turn, starting from the last one that worked.
+    private fun <T> withFailover(keys: List<String>, block: (String) -> T): T {
+        val start = prefs().getInt("idx", 0) % keys.size
+        var lastError = ""
+        for (i in keys.indices) {
+            val idx = (start + i) % keys.size
+            try {
+                val value = block(keys[idx])
+                prefs().edit().putInt("idx", idx).apply()
+                return value
+            } catch (e: KeyException) {
+                lastError = "Key ${idx + 1}: ${e.message}"
+            }
+        }
+        throw Exception("All keys failed.\n$lastError")
+    }
+
+    private fun askGroq(key: String, question: String): String {
+        val messages = JSONArray()
+        messages.put(JSONObject().put("role", "system").put("content", buildSystemPrompt()))
+        for (item in history) {
+            messages.put(JSONObject().put("role", item.first).put("content", item.second))
+        }
+        messages.put(JSONObject().put("role", "user").put("content", question))
+
+        val payload = JSONObject()
+        payload.put("model", chatModel)
+        payload.put("messages", messages)
+        payload.put("temperature", 0.4)
+        payload.put("max_tokens", 1500)
+        payload.put("reasoning_effort", "low")
+
+        val conn = URL("https://api.groq.com/openai/v1/chat/completions")
+            .openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 15000
+        conn.readTimeout = 60000
+        conn.setRequestProperty("Authorization", "Bearer $key")
+        conn.setRequestProperty("Content-Type", "application/json")
+        val os = conn.outputStream
+        os.write(payload.toString().toByteArray())
+        os.close()
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val body = stream.bufferedReader().readText()
+        if (code == 429 || code == 401 || code == 403) throw KeyException("Error $code")
+        if (code !in 200..299) throw Exception("Error $code: $body")
+        val choice = JSONObject(body).getJSONArray("choices").getJSONObject(0)
+        return choice.getJSONObject("message").getString("content").trim()
+    }
+
+    private fun transcribe(key: String): String {
+        val boundary = "----jarvis" + System.currentTimeMillis()
+        val conn = URL("https://api.groq.com/openai/v1/audio/transcriptions")
+            .openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 15000
+        conn.readTimeout = 60000
+        conn.setRequestProperty("Authorization", "Bearer $key")
+        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+
+        val out = DataOutputStream(conn.outputStream)
+        fun field(name: String, value: String) {
+            out.writeBytes("--$boundary\r\nContent-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n")
+        }
+        field("model", "whisper-large-v3-turbo")
+        field("response_format", "json")
+        out.writeBytes("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"rec.m4a\"\r\nContent-Type: audio/m4a\r\n\r\n")
+        out.write(audioFile.readBytes())
+        out.writeBytes("\r\n--$boundary--\r\n")
+        out.flush()
+        out.close()
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val body = stream.bufferedReader().readText()
+        if (code == 429 || code == 401 || code == 403) throw KeyException("Error $code")
+        if (code !in 200..299) throw Exception("Error $code: $body")
+        return JSONObject(body).getString("text").trim()
+    }
+}
