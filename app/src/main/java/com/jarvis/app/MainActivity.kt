@@ -46,6 +46,7 @@ class MainActivity : Activity() {
     @Volatile private var stopFlag = false
     @Volatile private var ttsError: String? = null
     private val END = ByteArray(0)
+    private val END_TEXT = "\u0000"
 
     private val audioFile by lazy { File(cacheDir, "rec.m4a") }
     private val cyan = Color.parseColor("#00E5FF")
@@ -316,7 +317,30 @@ If the user asks for something you cannot do on the phone (like subscribing to a
                     setUi(0, "TAP THE CORE TO SPEAK", "(nothing heard)", true)
                 } else {
                     setUi(2, "THINKING...", "YOU: $heard", false)
-                    val raw = withFailover(keys) { askGroq(it, heard) }
+                    val voice = voiceOn()
+                    val textQueue = LinkedBlockingQueue<String>()
+                    var speaker: Thread? = null
+                    if (voice) {
+                        speaking = true
+                        stopFlag = false
+                        ttsError = null
+                        speaker = Thread { speakStream(textQueue, keys) }
+                        speaker.start()
+                    }
+
+                    // Sentences are shown and spoken while the model is still writing.
+                    val head = "YOU: $heard\n\nJARVIS: "
+                    val shown = StringBuilder()
+                    val streamer = SayStreamer { piece ->
+                        if (shown.isNotEmpty()) shown.append(' ')
+                        shown.append(piece)
+                        val text = head + shown.toString()
+                        runOnUiThread { result.text = text }
+                        if (voice) textQueue.put(piece)
+                    }
+                    val raw = withFailover(keys) { askGroqStream(it, heard, streamer) }
+                    streamer.finish()
+
                     history.add(Pair("user", heard))
                     history.add(Pair("assistant", raw))
                     while (history.size > 8) {
@@ -329,30 +353,32 @@ If the user asks for something you cannot do on the phone (like subscribing to a
                     if (say.isEmpty()) {
                         say = if (action == "answer") raw else "Done."
                     }
-                    val sayText = say
+                    // Model ignored the JSON format: nothing was streamed, so speak it now.
+                    if (!streamer.sayFound && voice) textQueue.put(say)
 
                     val used = prefs().getInt("idx", 0) + 1
                     val label = "JARVIS  (KEY $used OF ${keys.size})"
-                    val shown = "YOU: $heard\n\nJARVIS: $sayText"
-                    if (voiceOn()) {
-                        speaking = true
-                        stopFlag = false
-                        ttsError = null
-                        setUi(0, "LOADING VOICE...", shown, true)
-                        speak(sayText, keys)
+                    val full = head + say
+                    val statusNow = if (voice && speaking) "SPEAKING... TAP CORE TO STOP" else label
+                    setUi(0, statusNow, full, true)
+
+                    // Run the command right away, while the voice is still talking.
+                    runAction(action, reply)
+
+                    if (voice) {
+                        textQueue.put(END_TEXT)
+                        speaker?.join()
                         val err = ttsError
                         runOnUiThread {
                             status.text = label
                             if (err != null) {
-                                result.text = shown + "\n\n(voice error: " + err + ")"
+                                result.text = full + "\n\n(voice error: " + err + ")"
                             }
                         }
-                    } else {
-                        setUi(0, label, shown, true)
                     }
-                    runAction(action, reply)
                 }
             } catch (e: Exception) {
+                stopFlag = true
                 speaking = false
                 setUi(0, "ERROR", e.message ?: "unknown error", true)
             }
@@ -393,38 +419,41 @@ If the user asks for something you cannot do on the phone (like subscribing to a
         stopFlag = true
     }
 
-    // Downloads the voice in pieces and plays them one after another.
-    private fun speak(text: String, keys: List<String>) {
+    // Takes sentences from textQueue as they arrive, downloads each one's voice,
+    // and plays them in order. A sentence is fetched while the previous one plays.
+    private fun speakStream(textQueue: LinkedBlockingQueue<String>, keys: List<String>) {
         try {
             val am = getSystemService(AUDIO_SERVICE) as AudioManager
             if (am.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
                 ttsError = "media volume is 0. Press the volume up button"
             }
 
-            val chunks = AudioUtil.splitForTts(text)
-            if (chunks.isEmpty()) return
-            val queue = LinkedBlockingQueue<ByteArray>()
+            val audioQueue = LinkedBlockingQueue<ByteArray>()
 
             Thread {
                 try {
-                    for (chunk in chunks) {
-                        if (stopFlag) break
-                        val bytes = withFailover(keys) { tts(it, chunk) }
-                        if (stopFlag) break
-                        if (bytes.size < 2000) {
-                            throw Exception("voice audio too small (" + bytes.size + " bytes)")
+                    while (!stopFlag) {
+                        val piece = textQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                        if (piece == END_TEXT) break
+                        for (chunk in AudioUtil.splitForTts(piece)) {
+                            if (stopFlag) break
+                            val bytes = withFailover(keys) { tts(it, chunk) }
+                            if (stopFlag) break
+                            if (bytes.size < 2000) {
+                                throw Exception("voice audio too small (" + bytes.size + " bytes)")
+                            }
+                            audioQueue.put(bytes)
                         }
-                        queue.put(bytes)
                     }
                 } catch (e: Exception) {
                     ttsError = e.message ?: "voice error"
                 } finally {
-                    queue.put(END)
+                    audioQueue.put(END)
                 }
             }.start()
 
             while (!stopFlag) {
-                val wav = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                val wav = audioQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
                 if (wav === END) break
                 runOnUiThread { status.text = "SPEAKING... TAP CORE TO STOP" }
                 try {
@@ -491,7 +520,9 @@ If the user asks for something you cannot do on the phone (like subscribing to a
         throw Exception("All keys failed.\n$lastError")
     }
 
-    private fun askGroq(key: String, question: String): String {
+    // Same request as before, but with stream=true. Each piece of the reply is
+    // pushed into the streamer as soon as it arrives.
+    private fun askGroqStream(key: String, question: String, streamer: SayStreamer): String {
         val messages = JSONArray()
         messages.put(JSONObject().put("role", "system").put("content", buildSystemPrompt()))
         for (item in history) {
@@ -505,6 +536,7 @@ If the user asks for something you cannot do on the phone (like subscribing to a
         payload.put("temperature", 0.4)
         payload.put("max_tokens", 1500)
         payload.put("reasoning_effort", "low")
+        payload.put("stream", true)
 
         val conn = URL("https://api.groq.com/openai/v1/chat/completions")
             .openConnection() as HttpURLConnection
@@ -519,12 +551,28 @@ If the user asks for something you cannot do on the phone (like subscribing to a
         os.close()
 
         val code = conn.responseCode
-        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val body = stream.bufferedReader().readText()
         if (code == 429 || code == 401 || code == 403) throw KeyException("Error $code")
-        if (code !in 200..299) throw Exception("Error $code: $body")
-        val choice = JSONObject(body).getJSONArray("choices").getJSONObject(0)
-        return choice.getJSONObject("message").getString("content").trim()
+        if (code !in 200..299) {
+            val body = conn.errorStream?.bufferedReader()?.readText() ?: ""
+            throw Exception("Error $code: $body")
+        }
+        conn.inputStream.bufferedReader().use { r ->
+            while (true) {
+                val line = r.readLine() ?: break
+                if (!line.startsWith("data:")) continue
+                val data = line.substring(5).trim()
+                if (data.isEmpty()) continue
+                if (data == "[DONE]") break
+                val delta = try {
+                    JSONObject(data).getJSONArray("choices").getJSONObject(0).optJSONObject("delta")
+                } catch (e: Exception) {
+                    null
+                } ?: continue
+                if (delta.isNull("content")) continue
+                streamer.feed(delta.getString("content"))
+            }
+        }
+        return streamer.raw().trim()
     }
 
     private fun transcribe(key: String): String {
