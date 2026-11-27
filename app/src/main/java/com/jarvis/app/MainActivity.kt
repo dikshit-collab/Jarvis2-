@@ -10,6 +10,9 @@ import android.graphics.Typeface
 import android.media.AudioManager
 import android.media.MediaRecorder
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
@@ -46,6 +49,60 @@ class MainActivity : Activity() {
     @Volatile private var stopFlag = false
     @Volatile private var ttsError: String? = null
     private val END = ByteArray(0)
+
+    // ---- Auto-stop: send automatically after silence ----
+    private val silenceMs = 2500L        // silence length that ends the recording
+    private val noSpeechMs = 8000L       // give up if nothing is said at all
+    private val maxRecordMs = 60000L     // safety limit
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var recStartedAt = 0L
+    private var lastVoiceAt = 0L
+    private var heardVoice = false
+    private var threshold = 0
+    private var calibSum = 0L
+    private var calibCount = 0
+
+    private val silenceCheck = object : Runnable {
+        override fun run() {
+            if (!recording) return
+            val r = recorder ?: return
+            val amp = try { r.maxAmplitude } catch (e: Exception) { 0 }
+            val now = SystemClock.uptimeMillis()
+            val elapsed = now - recStartedAt
+
+            if (elapsed < 600) {
+                // first 0.6s: learn how noisy the room is
+                if (amp > 0) {
+                    calibSum += amp
+                    calibCount++
+                }
+                if (amp > 3000) {
+                    heardVoice = true
+                    lastVoiceAt = now
+                }
+            } else {
+                if (threshold == 0) {
+                    val floor = if (calibCount > 0) (calibSum / calibCount).toInt() else 300
+                    threshold = (floor * 3).coerceIn(1500, 4000)
+                }
+                if (amp > threshold) {
+                    heardVoice = true
+                    lastVoiceAt = now
+                } else if (heardVoice && now - lastVoiceAt >= silenceMs) {
+                    stopRecording()
+                    return
+                } else if (!heardVoice && elapsed >= noSpeechMs) {
+                    cancelRecording("NOTHING HEARD. TAP THE CORE")
+                    return
+                }
+            }
+            if (elapsed >= maxRecordMs) {
+                stopRecording()
+                return
+            }
+            uiHandler.postDelayed(this, 100)
+        }
+    }
     private val END_TEXT = "\u0000"
 
     private val audioFile by lazy { File(cacheDir, "rec.m4a") }
@@ -206,6 +263,7 @@ If the user asks for something you cannot do on the phone (like subscribing to a
 
     override fun onDestroy() {
         super.onDestroy()
+        uiHandler.removeCallbacks(silenceCheck)
         stopSpeaking()
     }
 
@@ -290,15 +348,37 @@ If the user asks for something you cannot do on the phone (like subscribing to a
             recorder = r
             recording = true
             orb.state = 1
-            status.text = "LISTENING... TAP AGAIN TO SEND"
+            status.text = "LISTENING... SENDS AFTER 2.5s SILENCE"
             result.text = ""
+            recStartedAt = SystemClock.uptimeMillis()
+            lastVoiceAt = recStartedAt
+            heardVoice = false
+            threshold = 0
+            calibSum = 0
+            calibCount = 0
+            uiHandler.postDelayed(silenceCheck, 100)
         } catch (e: Exception) {
             status.text = "MIC ERROR"
             result.text = e.message ?: "unknown error"
         }
     }
 
+    // Stops recording and throws the audio away (used when nobody spoke).
+    private fun cancelRecording(msg: String) {
+        uiHandler.removeCallbacks(silenceCheck)
+        try {
+            recorder?.stop()
+        } catch (e: Exception) {
+        }
+        recorder?.release()
+        recorder = null
+        recording = false
+        orb.state = 0
+        status.text = msg
+    }
+
     private fun stopRecording() {
+        uiHandler.removeCallbacks(silenceCheck)
         try {
             recorder?.stop()
         } catch (e: Exception) {
